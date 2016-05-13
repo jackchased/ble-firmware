@@ -65,6 +65,8 @@
 // Services
 #include "st_util.h"
 #include "devinfoservice.h"
+#include "dinservice.h"
+#include "ainservice.h"
 #include "environmentalservice.h"
 #include "gasservice.h"
 #include "buzzerservice.h"
@@ -73,6 +75,7 @@
 #include "GasShtSensor.h"
 #include "hal_sensor.h"
 
+#include "hal_din.h"
 #include "hal_humi.h"
 #include "hal_buzzer.h"
 
@@ -85,6 +88,7 @@
  */
 
 // How often to perform periodic event
+#define AIN_DEFAULT_PERIOD                    2000
 #define HUM_DEFAULT_PERIOD                    2000
 #define GAS_DEFAULT_PERIOD                    2000
 
@@ -201,6 +205,7 @@ static uint8 advertData[] =
 static uint8 attDeviceName[GAP_DEVICE_NAME_LEN] = "Gas Sht Sensor";
 
 // Sensor State Variables
+static bool   ainEnabled = FALSE;
 static bool   humiEnabled = FALSE;
 static bool   gasEnabled = FALSE;
 static bool   buzzerEnabled = FALSE;
@@ -208,6 +213,7 @@ static bool   buzzerEnabled = FALSE;
 static uint8  humiState = 0;
 static uint8  buzzerOnoff;
 
+static uint16 sensorAinPeriod = AIN_DEFAULT_PERIOD;
 static uint16 sensorHumPeriod = HUM_DEFAULT_PERIOD;
 static uint16 sensorGasPeriod = GAS_DEFAULT_PERIOD;
 /*********************************************************************
@@ -216,10 +222,12 @@ static uint16 sensorGasPeriod = GAS_DEFAULT_PERIOD;
 static void GasShtSensor_ProcessOSALMsg( osal_event_hdr_t *pMsg );
 static void peripheralStateNotificationCB( gaprole_States_t newState );
 
+static uint16 readAdcData( uint8 channel );
 static void readHumData( void );
 static void readMq2Data( void );
 static uint16 readAdcData( uint8 channel );
 
+static void ainChangeCB( uint8 paramID );
 static void environmentalChangeCB( uint8 paramID );
 static void gasChangeCB( uint8 paramID );
 static void buzzerChangeCB( uint8 paramID );
@@ -251,6 +259,11 @@ static gapBondCBs_t GasShtSensor_BondMgrCBs =
 };
 
 // Simple GATT Profile Callbacks
+static sensorCBs_t GasShtSensor_AinCBs =
+{
+  ainChangeCB,              // Characteristic value change callback
+};
+
 static sensorCBs_t GasShtSensor_EnvironmentalCBs =
 {
   environmentalChangeCB,    // Characteristic value change callback
@@ -356,6 +369,8 @@ void GasShtSensor_Init( uint8 task_id )
   GGS_AddService( GATT_ALL_SERVICES );            // GAP
   GATTServApp_AddService( GATT_ALL_SERVICES );    // GATT attributes
   DevInfo_AddService();                           // Device Information Service
+  Din_AddService( GATT_ALL_SERVICES );            // Digital Input Service
+  Ain_AddService( GATT_ALL_SERVICES );            // Analog Input Service
   Environmental_AddService( GATT_ALL_SERVICES );
   Gas_AddService( GATT_ALL_SERVICES );
   Buzzer_AddService( GATT_ALL_SERVICES );
@@ -368,11 +383,13 @@ void GasShtSensor_Init( uint8 task_id )
   resetCharacteristicValues();
   
   // Initialise sensor drivers
+  HalDinInit();
   HalHumiInit();
   HalBuzzerInit();
   APCFG |= BV(0);
 
   // Register callback with SimpleGATTprofile
+  VOID Ain_RegisterAppCBs( &GasShtSensor_AinCBs );
   VOID Environmental_RegisterAppCBs( &GasShtSensor_EnvironmentalCBs );
   VOID Gas_RegisterAppCBs( &GasShtSensor_GasCBs );
   VOID Buzzer_RegisterAppCBs( &GasShtSensor_BuzzerCBs );
@@ -384,6 +401,7 @@ void GasShtSensor_Init( uint8 task_id )
 
   // Setup a delayed profile startup
   osal_set_event( GasShtSensor_TaskID, SBP_START_DEVICE_EVT );
+  HalLedSet (HAL_LED_1, HAL_LED_MODE_ON);
 }
 
 /*********************************************************************
@@ -429,6 +447,28 @@ uint16 GasShtSensor_ProcessEvent( uint8 task_id, uint16 events )
     VOID GAPBondMgr_Register( &GasShtSensor_BondMgrCBs );
 
     return ( events ^ SBP_START_DEVICE_EVT );
+  }
+
+  //////////////////////////
+  //         AIN          //
+  //////////////////////////
+  if ( events & SBP_READ_AIN_EVT )
+  {
+    if(ainEnabled)
+    {
+      uint16 ainData;
+      ainData = readAdcData(HAL_ADC_CHANNEL_6);
+      Ain_SetParameter(SENSOR_DATA, AIN_DATA_LEN, &ainData);
+      
+      osal_start_timerEx( GasShtSensor_TaskID, SBP_READ_AIN_EVT, sensorAinPeriod );
+    }
+    else
+    {
+      resetCharacteristicValue( AIN_SERV_UUID, SENSOR_DATA, 0, AIN_DATA_LEN);
+      resetCharacteristicValue( AIN_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof ( uint8 ));
+    }
+
+    return (events ^ SBP_READ_AIN_EVT);
   }
 
   //////////////////////////
@@ -585,6 +625,11 @@ static void GasShtSensor_HandleKeys( uint8 shift, uint8 keys )
  */
 static void resetSensorSetup (void)
 {
+  if (ainEnabled)
+  {
+    ainEnabled = FALSE;
+  }
+
   if (humiEnabled)
   {
     HalHumiInit();
@@ -830,6 +875,53 @@ static uint16 readAdcData( uint8 channel )
 }
 
 /*********************************************************************
+ * @fn      ainChangeCB
+ *
+ * @brief   Callback from Ain Service indicating a value change
+ *
+ * @param   paramID - parameter ID of the value that was changed.
+ *
+ * @return  none
+ */
+static void ainChangeCB( uint8 paramID )
+{
+  uint8 newValue;
+
+  switch (paramID)
+  {
+    case SENSOR_CONF:
+      Ain_GetParameter( SENSOR_CONF, &newValue );
+
+      if ( newValue == ST_CFG_SENSOR_DISABLE )
+      {
+        if(ainEnabled)
+        {
+          ainEnabled = FALSE;
+          osal_set_event( GasShtSensor_TaskID, SBP_READ_AIN_EVT);
+        }
+      }
+      else if ( newValue == ST_CFG_SENSOR_ENABLE )
+      {
+        if(!ainEnabled)
+        {
+          ainEnabled = TRUE;
+          osal_set_event( GasShtSensor_TaskID, SBP_READ_AIN_EVT);
+        }
+      }
+      break;
+
+    case SENSOR_PERI:
+      Ain_GetParameter( SENSOR_PERI, &newValue );
+      sensorAinPeriod = newValue*SENSOR_PERIOD_RESOLUTION;
+      break;
+
+    default:
+      // Should not get here
+      break;
+  }
+}
+
+/*********************************************************************
  * @fn      environmentalChangeCB
  *
  * @brief   Callback from Environmental Service indicating a value change
@@ -998,6 +1090,10 @@ static void resetCharacteristicValue(uint16 servUuid, uint8 paramID, uint8 value
 
   switch(servUuid)
   {
+    case AIN_SERV_UUID:
+      Ain_SetParameter( paramID, paramLen, pData);
+      break;
+
     case ENVIRONMENTAL_SERV_UUID:
       Environmental_SetParameter( paramID, paramLen, pData);
       break;
@@ -1027,6 +1123,10 @@ static void resetCharacteristicValue(uint16 servUuid, uint8 paramID, uint8 value
  */
 static void resetCharacteristicValues( void )
 {
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_DATA, 0, AIN_DATA_LEN);
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof( uint8 ));
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_PERI, AIN_DEFAULT_PERIOD / SENSOR_PERIOD_RESOLUTION, sizeof ( uint8 ));
+
   resetCharacteristicValue( ENVIRONMENTAL_SERV_UUID, SENSOR_DATA, 0, TEMP_DATA_LEN);
   resetCharacteristicValue( ENVIRONMENTAL_SERV_UUID, SENSOR_DATA1, 0, TEMP_DATA_LEN);
   resetCharacteristicValue( ENVIRONMENTAL_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof( uint8 ));

@@ -46,6 +46,8 @@
 #include "OSAL_PwrMgr.h"
 
 #include "OnBoard.h"
+#include "hal_adc.h"
+#include "hal_led.h"
 #include "hal_i2c.h"
 
 #include "gatt.h"
@@ -66,6 +68,8 @@
 // Services
 #include "st_util.h"
 #include "devinfoservice.h"
+#include "dinservice.h"
+#include "ainservice.h"
 #include "environmentalservice.h"
 #include "gyroservice.h"
 
@@ -73,6 +77,7 @@
 #include "NineAxisSensor.h"
 #include "hal_sensor.h"
 
+#include "hal_din.h"
 #include "hal_mag.h"
 #include "hal_acc_gyro.h"
 
@@ -85,6 +90,7 @@
  */
 
 // How often to perform periodic event
+#define AIN_DEFAULT_PERIOD                    2000
 #define MAG_DEFAULT_PERIOD                    2000
 #define GYRO_DEFAULT_PERIOD                   2000
 
@@ -200,9 +206,11 @@ static uint8 advertData[] =
 static uint8 attDeviceName[GAP_DEVICE_NAME_LEN] = "Nine Axis Sensor";
 
 // Sensor State Variables
+static bool   ainEnabled = FALSE;
 static bool   magEnabled = FALSE;
 static bool   gyroEnabled = FALSE;
 
+static uint16 sensorAinPeriod = AIN_DEFAULT_PERIOD;
 static uint16 sensorMagPeriod = MAG_DEFAULT_PERIOD;
 static uint16 sensorGyrPeriod = GYRO_DEFAULT_PERIOD;
 
@@ -212,9 +220,11 @@ static uint16 sensorGyrPeriod = GYRO_DEFAULT_PERIOD;
 static void NineAxisSensor_ProcessOSALMsg( osal_event_hdr_t *pMsg );
 static void peripheralStateNotificationCB( gaprole_States_t newState );
 
+static uint16 readAdcData( uint8 channel );
 static void readMagData( void );
 static void readGyroData( void );
 
+static void ainChangeCB( uint8 paramID );
 static void environmentalChangeCB( uint8 paramID );
 static void gyroChangeCB( uint8 paramID );
 
@@ -245,12 +255,17 @@ static gapBondCBs_t NineAxisSensor_BondMgrCBs =
 };
 
 // Simple GATT Profile Callbacks
-static sensorCBs_t sensorTag_EnvironmentalCBs =
+static sensorCBs_t NineAxisSensor_AinCBs =
+{
+  ainChangeCB,              // Characteristic value change callback
+};
+
+static sensorCBs_t NineAxisSensor_EnvironmentalCBs =
 {
   environmentalChangeCB,    // Characteristic value change callback
 };
 
-static sensorCBs_t sensorTag_GyroCBs =
+static sensorCBs_t NineAxisSensor_GyroCBs =
 {
   gyroChangeCB,             // Characteristic value change callback
 };
@@ -345,6 +360,8 @@ void NineAxisSensor_Init( uint8 task_id )
   GGS_AddService( GATT_ALL_SERVICES );            // GAP
   GATTServApp_AddService( GATT_ALL_SERVICES );    // GATT attributes
   DevInfo_AddService();                           // Device Information Service
+  Din_AddService( GATT_ALL_SERVICES );            // Digital Input Service
+  Ain_AddService( GATT_ALL_SERVICES );            // Analog Input Service
   Environmental_AddService( GATT_ALL_SERVICES );  // Environmental Service
   Gyro_AddService( GATT_ALL_SERVICES );           // Gyro Service
   
@@ -356,20 +373,23 @@ void NineAxisSensor_Init( uint8 task_id )
   resetCharacteristicValues();
 
   // Initialise sensor drivers
+  HalDinInit();
   HalMagInit();
   HalAccGyroInit();
 
   // Register callback with SimpleGATTprofile
-  VOID Environmental_RegisterAppCBs( &sensorTag_EnvironmentalCBs );
-  VOID Gyro_RegisterAppCBs( &sensorTag_GyroCBs );
+  VOID Ain_RegisterAppCBs( &NineAxisSensor_AinCBs );
+  VOID Environmental_RegisterAppCBs( &NineAxisSensor_EnvironmentalCBs );
+  VOID Gyro_RegisterAppCBs( &NineAxisSensor_GyroCBs );
   
   // Enable clock divide on halt
   // This reduces active current while radio is active and CC254x MCU
   // is halted
-  HCI_EXT_ClkDivOnHaltCmd( HCI_EXT_ENABLE_CLK_DIVIDE_ON_HALT );
+  // HCI_EXT_ClkDivOnHaltCmd( HCI_EXT_ENABLE_CLK_DIVIDE_ON_HALT );
 
   // Setup a delayed profile startup
   osal_set_event( NineAxisSensor_TaskID, SBP_START_DEVICE_EVT );
+  HalLedSet (HAL_LED_1, HAL_LED_MODE_ON);
 }
 
 /*********************************************************************
@@ -415,6 +435,28 @@ uint16 NineAxisSensor_ProcessEvent( uint8 task_id, uint16 events )
     VOID GAPBondMgr_Register( &NineAxisSensor_BondMgrCBs );
 
     return ( events ^ SBP_START_DEVICE_EVT );
+  }
+
+  //////////////////////////
+  //         AIN          //
+  //////////////////////////
+  if ( events & SBP_READ_AIN_EVT )
+  {
+    if(ainEnabled)
+    {
+      uint16 ainData;
+      ainData = readAdcData(HAL_ADC_CHANNEL_6);
+      Ain_SetParameter(SENSOR_DATA, AIN_DATA_LEN, &ainData);
+      
+      osal_start_timerEx( NineAxisSensor_TaskID, SBP_READ_AIN_EVT, sensorAinPeriod );
+    }
+    else
+    {
+      resetCharacteristicValue( AIN_SERV_UUID, SENSOR_DATA, 0, AIN_DATA_LEN);
+      resetCharacteristicValue( AIN_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof ( uint8 ));
+    }
+
+    return (events ^ SBP_READ_AIN_EVT);
   }
 
   //////////////////////////
@@ -508,6 +550,11 @@ static void NineAxisSensor_ProcessOSALMsg( osal_event_hdr_t *pMsg )
  */
 static void resetSensorSetup (void)
 {
+  if (ainEnabled)
+  {
+    ainEnabled = FALSE;
+  }
+
   if (HalMagStatus()!=MAG3110_OFF || magEnabled)
   {
     HalMagTurnOff();
@@ -668,6 +715,75 @@ static void readGyroData( void )
 }
 
 /*********************************************************************
+ * @fn      readAdcData
+ *
+ * @brief   Read ADC channel value
+ *
+ * @return  none
+ */
+static uint16 readAdcData( uint8 channel )
+{
+  uint16 adcVdd3, adcChannel, vdd,  voltage;
+
+  HalAdcSetReference(HAL_ADC_REF_125V);
+  adcVdd3 = HalAdcRead(HAL_ADC_CHN_VDD3, HAL_ADC_RESOLUTION_8);
+  vdd = (adcVdd3) * 29;  // (1240 * 3 / 127), ADC internal voltage for CC254x is 1.24V
+
+  HalAdcSetReference( HAL_ADC_REF_AVDD );
+  adcChannel = HalAdcRead( channel, HAL_ADC_RESOLUTION_8);
+  voltage = (uint16)( ((uint32)adcChannel * (uint32)vdd) / 127 );
+
+  return voltage;
+}
+
+/*********************************************************************
+ * @fn      ainChangeCB
+ *
+ * @brief   Callback from Ain Service indicating a value change
+ *
+ * @param   paramID - parameter ID of the value that was changed.
+ *
+ * @return  none
+ */
+static void ainChangeCB( uint8 paramID )
+{
+  uint8 newValue;
+
+  switch (paramID)
+  {
+    case SENSOR_CONF:
+      Ain_GetParameter( SENSOR_CONF, &newValue );
+
+      if ( newValue == ST_CFG_SENSOR_DISABLE )
+      {
+        if(ainEnabled)
+        {
+          ainEnabled = FALSE;
+          osal_set_event( NineAxisSensor_TaskID, SBP_READ_AIN_EVT);
+        }
+      }
+      else if ( newValue == ST_CFG_SENSOR_ENABLE )
+      {
+        if(!ainEnabled)
+        {
+          ainEnabled = TRUE;
+          osal_set_event( NineAxisSensor_TaskID, SBP_READ_AIN_EVT);
+        }
+      }
+      break;
+
+    case SENSOR_PERI:
+      Ain_GetParameter( SENSOR_PERI, &newValue );
+      sensorAinPeriod = newValue*SENSOR_PERIOD_RESOLUTION;
+      break;
+
+    default:
+      // Should not get here
+      break;
+  }
+}
+
+/*********************************************************************
  * @fn      environmentalChangeCB
  *
  * @brief   Callback from Magnetometer Service indicating a value change
@@ -789,6 +905,10 @@ static void resetCharacteristicValue(uint16 servUuid, uint8 paramID, uint8 value
 
   switch(servUuid)
   {
+    case AIN_SERV_UUID:
+      Ain_SetParameter( paramID, paramLen, pData);
+      break;
+
     case ENVIRONMENTAL_SERV_UUID:
       Environmental_SetParameter( paramID, paramLen, pData);
       break;
@@ -814,10 +934,13 @@ static void resetCharacteristicValue(uint16 servUuid, uint8 paramID, uint8 value
  */
 static void resetCharacteristicValues( void )
 {
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_DATA, 0, AIN_DATA_LEN);
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof( uint8 ));
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_PERI, AIN_DEFAULT_PERIOD / SENSOR_PERIOD_RESOLUTION, sizeof ( uint8 ));
+
   resetCharacteristicValue( ENVIRONMENTAL_SERV_UUID, SENSOR_DATA, 0, MAGNETOMETER_DATA_LEN);
   resetCharacteristicValue( ENVIRONMENTAL_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof( uint8 ));
   resetCharacteristicValue( ENVIRONMENTAL_SERV_UUID, SENSOR_PERI, MAG_DEFAULT_PERIOD / SENSOR_PERIOD_RESOLUTION, sizeof ( uint8 ));
-
 
   resetCharacteristicValue( GYROSCOPE_SERV_UUID, SENSOR_DATA, 0, GYROSCOPE_DATA_LEN);
   resetCharacteristicValue( GYROSCOPE_SERV_UUID, SENSOR_DATA1, 0, ACCELEROMETER_DATA_LEN);

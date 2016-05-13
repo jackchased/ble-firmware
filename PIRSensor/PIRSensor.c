@@ -69,6 +69,7 @@
 #include "st_util.h"
 #include "devinfoservice.h"
 #include "pirservice.h"
+#include "ainservice.h"
 
 // Sensor drivers
 #include "PIRSensor.h"
@@ -82,6 +83,9 @@
 /*********************************************************************
  * CONSTANTS
  */
+
+// How often to perform periodic event
+#define AIN_DEFAULT_PERIOD                    2000
 
 // What is the advertising interval when device is discoverable (units of 625us, 160=100ms)
 #define DEFAULT_ADVERTISING_INTERVAL          160
@@ -189,11 +193,19 @@ static uint8 advertData[] =
 // GAP GATT Attributes
 static uint8 attDeviceName[GAP_DEVICE_NAME_LEN] = "PIR Sensor";
 
+// Sensor State Variables
+static bool   ainEnabled = FALSE;
+static uint16 sensorAinPeriod = AIN_DEFAULT_PERIOD;
+
 /*********************************************************************
  * LOCAL FUNCTIONS
  */
 static void PIRSensor_ProcessOSALMsg( osal_event_hdr_t *pMsg );
 static void peripheralStateNotificationCB( gaprole_States_t newState );
+
+static uint16 readAdcData( uint8 channel );
+
+static void ainChangeCB( uint8 paramID );
 
 static void resetSensorSetup( void );
 static void resetCharacteristicValue( uint16 servID, uint8 paramID, uint8 value, uint8 paramLen );
@@ -219,6 +231,12 @@ static gapBondCBs_t PIRSensor_BondMgrCBs =
 {
   NULL,                     // Passcode callback (not used by application)
   NULL                      // Pairing / Bonding state Callback (not used by application)
+};
+
+// Simple GATT Profile Callbacks
+static sensorCBs_t PIRSensor_AinCBs =
+{
+  ainChangeCB,              // Characteristic value change callback
 };
 
 /*********************************************************************
@@ -312,6 +330,7 @@ void PIRSensor_Init( uint8 task_id )
   GATTServApp_AddService( GATT_ALL_SERVICES );    // GATT attributes
   DevInfo_AddService();                           // Device Information Service
   Pir_AddService( GATT_ALL_SERVICES );
+  Ain_AddService( GATT_ALL_SERVICES );            // Analog Input Service
 
 #if defined FEATURE_OAD
   VOID OADTarget_AddService();                    // OAD Profile
@@ -323,6 +342,9 @@ void PIRSensor_Init( uint8 task_id )
   // Initialise sensor drivers
   HalPirInit();
 
+  // Register callback with SimpleGATTprofile
+  VOID Ain_RegisterAppCBs( &PIRSensor_AinCBs );
+
   // Enable clock divide on halt
   // This reduces active current while radio is active and CC254x MCU
   // is halted
@@ -330,6 +352,7 @@ void PIRSensor_Init( uint8 task_id )
 
   // Setup a delayed profile startup
   osal_set_event( PIRSensor_TaskID, SBP_START_DEVICE_EVT );
+  HalLedSet (HAL_LED_1, HAL_LED_MODE_ON);
 }
 
 /*********************************************************************
@@ -375,6 +398,28 @@ uint16 PIRSensor_ProcessEvent( uint8 task_id, uint16 events )
     VOID GAPBondMgr_Register( &PIRSensor_BondMgrCBs );
 
     return ( events ^ SBP_START_DEVICE_EVT );
+  }
+
+  //////////////////////////
+  //         AIN          //
+  //////////////////////////
+  if ( events & SBP_READ_AIN_EVT )
+  {
+    if(ainEnabled)
+    {
+      uint16 ainData;
+      ainData = readAdcData(HAL_ADC_CHANNEL_6);
+      Ain_SetParameter(SENSOR_DATA, AIN_DATA_LEN, &ainData);
+      
+      osal_start_timerEx( PIRSensor_TaskID, SBP_READ_AIN_EVT, sensorAinPeriod );
+    }
+    else
+    {
+      resetCharacteristicValue( AIN_SERV_UUID, SENSOR_DATA, 0, AIN_DATA_LEN);
+      resetCharacteristicValue( AIN_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof ( uint8 ));
+    }
+
+    return (events ^ SBP_READ_AIN_EVT);
   }
 
   // Discard unknown events
@@ -623,6 +668,75 @@ static void peripheralStateNotificationCB( gaprole_States_t newState )
 }
 
 /*********************************************************************
+ * @fn      readAdcData
+ *
+ * @brief   Read ADC channel value
+ *
+ * @return  none
+ */
+static uint16 readAdcData( uint8 channel )
+{
+  uint16 adcVdd3, adcChannel, vdd,  voltage;
+
+  HalAdcSetReference(HAL_ADC_REF_125V);
+  adcVdd3 = HalAdcRead(HAL_ADC_CHN_VDD3, HAL_ADC_RESOLUTION_8);
+  vdd = (adcVdd3) * 29;  // (1240 * 3 / 127), ADC internal voltage for CC254x is 1.24V
+
+  HalAdcSetReference( HAL_ADC_REF_AVDD );
+  adcChannel = HalAdcRead( channel, HAL_ADC_RESOLUTION_8);
+  voltage = (uint16)( ((uint32)adcChannel * (uint32)vdd) / 127 );
+
+  return voltage;
+}
+
+/*********************************************************************
+ * @fn      ainChangeCB
+ *
+ * @brief   Callback from Ain Service indicating a value change
+ *
+ * @param   paramID - parameter ID of the value that was changed.
+ *
+ * @return  none
+ */
+static void ainChangeCB( uint8 paramID )
+{
+  uint8 newValue;
+
+  switch (paramID)
+  {
+    case SENSOR_CONF:
+      Ain_GetParameter( SENSOR_CONF, &newValue );
+
+      if ( newValue == ST_CFG_SENSOR_DISABLE )
+      {
+        if(ainEnabled)
+        {
+          ainEnabled = FALSE;
+          osal_set_event( PIRSensor_TaskID, SBP_READ_AIN_EVT);
+        }
+      }
+      else if ( newValue == ST_CFG_SENSOR_ENABLE )
+      {
+        if(!ainEnabled)
+        {
+          ainEnabled = TRUE;
+          osal_set_event( PIRSensor_TaskID, SBP_READ_AIN_EVT);
+        }
+      }
+      break;
+
+    case SENSOR_PERI:
+      Ain_GetParameter( SENSOR_PERI, &newValue );
+      sensorAinPeriod = newValue*SENSOR_PERIOD_RESOLUTION;
+      break;
+
+    default:
+      // Should not get here
+      break;
+  }
+}
+
+/*********************************************************************
  * @fn      resetCharacteristicValue
  *
  * @brief   Initialize a characteristic value to zero
@@ -650,6 +764,10 @@ static void resetCharacteristicValue(uint16 servUuid, uint8 paramID, uint8 value
 
   switch(servUuid)
   {
+    case AIN_SERV_UUID:
+      Ain_SetParameter( paramID, paramLen, pData);
+      break;
+
     case PIR_SERV_UUID:
       Pir_SetParameter( paramID, paramLen, pData);
       break;
@@ -671,6 +789,10 @@ static void resetCharacteristicValue(uint16 servUuid, uint8 paramID, uint8 value
  */
 static void resetCharacteristicValues( void )
 {
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_DATA, 0, AIN_DATA_LEN);
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof( uint8 ));
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_PERI, AIN_DEFAULT_PERIOD / SENSOR_PERIOD_RESOLUTION, sizeof ( uint8 ));
+
   resetCharacteristicValue( PIR_SERV_UUID, SENSOR_DATA, 0, PIR_DATA_LEN);
 }
 
