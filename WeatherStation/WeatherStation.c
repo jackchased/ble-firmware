@@ -65,6 +65,8 @@
 // Services
 #include "st_util.h"
 #include "devinfoservice.h"
+#include "dinservice.h"
+#include "ainservice.h"
 #include "environmentalservice.h"
 #include "gasservice.h"
 #include "micservice.h"
@@ -73,6 +75,7 @@
 #include "WeatherStation.h"
 #include "hal_sensor.h"
 
+#include "hal_din.h"
 #include "hal_bar.h"
 #include "hal_humi.h"
 #include "hal_uv.h"
@@ -86,6 +89,7 @@
  */
 
 // How often to perform periodic event
+#define AIN_DEFAULT_PERIOD                    2000
 #define BAR_DEFAULT_PERIOD                    2000
 #define HUM_DEFAULT_PERIOD                    2000
 #define UV_DEFAULT_PERIOD                     2000
@@ -207,6 +211,7 @@ static uint8 advertData[] =
 static uint8 attDeviceName[GAP_DEVICE_NAME_LEN] = "Weather Station";
 
 // Sensor State Variables
+static bool   ainEnabled = FALSE;
 static bool   barEnabled = FALSE;
 static bool   humiEnabled = FALSE;
 static bool   uvEnabled = FALSE;
@@ -215,6 +220,7 @@ static bool   micEnabled = FALSE;
 
 static uint8  humiState = 0;
 
+static uint16 sensorAinPeriod = AIN_DEFAULT_PERIOD;
 static uint16 sensorBarPeriod = BAR_DEFAULT_PERIOD;
 static uint16 sensorHumPeriod = HUM_DEFAULT_PERIOD;
 static uint16 sensorUvPeriod = UV_DEFAULT_PERIOD;
@@ -235,6 +241,7 @@ static void readMicData( void );
 static uint16 readAdcData( uint8 channel );
 static uint16 readAdcDataRes14( uint8 channel );
 
+static void ainChangeCB( uint8 paramID );
 static void environmentalChangeCB( uint8 paramID );
 static void gasChangeCB( uint8 paramID );
 static void micChangeCB( uint8 paramID );
@@ -266,6 +273,11 @@ static gapBondCBs_t WeatherStation_BondMgrCBs =
 };
 
 // Simple GATT Profile Callbacks
+static sensorCBs_t WeatherStation_AinCBs =
+{
+  ainChangeCB,              // Characteristic value change callback
+};
+
 static sensorCBs_t WeatherStation_EnvironmentalCBs =
 {
   environmentalChangeCB,    // Characteristic value change callback
@@ -371,6 +383,8 @@ void WeatherStation_Init( uint8 task_id )
   GGS_AddService( GATT_ALL_SERVICES );            // GAP
   GATTServApp_AddService( GATT_ALL_SERVICES );    // GATT attributes
   DevInfo_AddService();                           // Device Information Service
+  Din_AddService( GATT_ALL_SERVICES );            // Digital Input Service
+  Ain_AddService( GATT_ALL_SERVICES );            // Analog Input Service
   Environmental_AddService( GATT_ALL_SERVICES );
   Gas_AddService( GATT_ALL_SERVICES );
   Mic_AddService( GATT_ALL_SERVICES );
@@ -383,12 +397,14 @@ void WeatherStation_Init( uint8 task_id )
   resetCharacteristicValues();
 
   // Initialise sensor drivers
+  HalDinInit();
   HalBarInit();
   HalHumiInit();
   APCFG |= BV(0);
   APCFG |= BV(4);
 
   // Register callback with SimpleGATTprofile
+  VOID Ain_RegisterAppCBs( &WeatherStation_AinCBs );
   VOID Environmental_RegisterAppCBs( &WeatherStation_EnvironmentalCBs );
   VOID Gas_RegisterAppCBs( &WeatherStation_GasCBs );
   VOID Mic_RegisterAppCBs( &WeatherStation_MicCBs );
@@ -401,6 +417,7 @@ void WeatherStation_Init( uint8 task_id )
   // Setup a delayed profile startup
   // osal_set_event( WeatherStation_TaskID, SBP_START_DEVICE_EVT );
   osal_start_timerEx( WeatherStation_TaskID, SBP_START_DEVICE_EVT, 50 );
+  HalLedSet (HAL_LED_1, HAL_LED_MODE_ON);
 }
 
 /*********************************************************************
@@ -448,6 +465,28 @@ uint16 WeatherStation_ProcessEvent( uint8 task_id, uint16 events )
     HalUvInit();
 
     return ( events ^ SBP_START_DEVICE_EVT );
+  }
+
+  //////////////////////////
+  //         AIN          //
+  //////////////////////////
+  if ( events & SBP_READ_AIN_EVT )
+  {
+    if(ainEnabled)
+    {
+      uint16 ainData;
+      ainData = readAdcData(HAL_ADC_CHANNEL_6);
+      Ain_SetParameter(SENSOR_DATA, AIN_DATA_LEN, &ainData);
+      
+      osal_start_timerEx( WeatherStation_TaskID, SBP_READ_AIN_EVT, sensorAinPeriod );
+    }
+    else
+    {
+      resetCharacteristicValue( AIN_SERV_UUID, SENSOR_DATA, 0, AIN_DATA_LEN);
+      resetCharacteristicValue( AIN_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof ( uint8 ));
+    }
+
+    return (events ^ SBP_READ_AIN_EVT);
   }
 
   //////////////////////////
@@ -671,6 +710,11 @@ static void WeatherStation_HandleKeys( uint8 shift, uint8 keys )
  */
 static void resetSensorSetup (void)
 {
+  if (ainEnabled)
+  {
+    ainEnabled = FALSE;
+  }
+
   if (barEnabled)
   {
     HalBarTurnOff();
@@ -964,6 +1008,12 @@ static void readMicData( void )
   uint16 dB_SPL;
   uint16 vout = readAdcDataRes14(HAL_ADC_CHANNEL_4);
 
+  if(vout >= 16500)
+  {
+    vout = vout - 16500;
+  } else {
+    vout = 16500 - vout;
+  }
   Pa = ( (float)vout * 10 ) / 72254;
   dB_SPL = (uint16)(20 * log10(Pa / 0.00002));
 
@@ -987,7 +1037,7 @@ static uint16 readAdcData( uint8 channel )
 
   HalAdcSetReference( HAL_ADC_REF_AVDD );
   adcChannel = HalAdcRead( channel, HAL_ADC_RESOLUTION_8);
-  voltage = (adcChannel) * (vdd / 127);
+  voltage = (uint16)( ((uint32)adcChannel * (uint32)vdd) / 127 );
 
   return voltage;
 }
@@ -1009,9 +1059,56 @@ static uint16 readAdcDataRes14( uint8 channel )
 
   HalAdcSetReference( HAL_ADC_REF_AVDD );
   adcChannel = HalAdcRead( channel, HAL_ADC_RESOLUTION_14);
-  voltage = (adcChannel) * (vdd / 8191);
+  voltage = (uint16)( ((uint32)adcChannel * (uint32)vdd) / 8191 );
 
   return voltage;
+}
+
+/*********************************************************************
+ * @fn      ainChangeCB
+ *
+ * @brief   Callback from Ain Service indicating a value change
+ *
+ * @param   paramID - parameter ID of the value that was changed.
+ *
+ * @return  none
+ */
+static void ainChangeCB( uint8 paramID )
+{
+  uint8 newValue;
+
+  switch (paramID)
+  {
+    case SENSOR_CONF:
+      Ain_GetParameter( SENSOR_CONF, &newValue );
+
+      if ( newValue == ST_CFG_SENSOR_DISABLE )
+      {
+        if(ainEnabled)
+        {
+          ainEnabled = FALSE;
+          osal_set_event( WeatherStation_TaskID, SBP_READ_AIN_EVT);
+        }
+      }
+      else if ( newValue == ST_CFG_SENSOR_ENABLE )
+      {
+        if(!ainEnabled)
+        {
+          ainEnabled = TRUE;
+          osal_set_event( WeatherStation_TaskID, SBP_READ_AIN_EVT);
+        }
+      }
+      break;
+
+    case SENSOR_PERI:
+      Ain_GetParameter( SENSOR_PERI, &newValue );
+      sensorAinPeriod = newValue*SENSOR_PERIOD_RESOLUTION;
+      break;
+
+    default:
+      // Should not get here
+      break;
+  }
 }
 
 /*********************************************************************
@@ -1201,7 +1298,7 @@ static void micChangeCB( uint8 paramID )
       break;
 
     case SENSOR_PERI:
-      Gas_GetParameter( SENSOR_PERI, &newValue );
+      Mic_GetParameter( SENSOR_PERI, &newValue );
       sensorMicPeriod = newValue*SENSOR_PERIOD_RESOLUTION;
       break;
 
@@ -1239,6 +1336,10 @@ static void resetCharacteristicValue(uint16 servUuid, uint8 paramID, uint8 value
 
   switch(servUuid)
   {
+    case AIN_SERV_UUID:
+      Ain_SetParameter( paramID, paramLen, pData);
+      break;
+
     case ENVIRONMENTAL_SERV_UUID:
       Environmental_SetParameter( paramID, paramLen, pData);
       break;
@@ -1268,6 +1369,10 @@ static void resetCharacteristicValue(uint16 servUuid, uint8 paramID, uint8 value
  */
 static void resetCharacteristicValues( void )
 {
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_DATA, 0, AIN_DATA_LEN);
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof( uint8 ));
+  resetCharacteristicValue( AIN_SERV_UUID, SENSOR_PERI, AIN_DEFAULT_PERIOD / SENSOR_PERIOD_RESOLUTION, sizeof ( uint8 ));
+
   resetCharacteristicValue( ENVIRONMENTAL_SERV_UUID, SENSOR_DATA, 0, BAROMETER_DATA_LEN);
   resetCharacteristicValue( ENVIRONMENTAL_SERV_UUID, SENSOR_CONF, ST_CFG_SENSOR_DISABLE, sizeof( uint8 ));
   resetCharacteristicValue( ENVIRONMENTAL_SERV_UUID, SENSOR_PERI, BAR_DEFAULT_PERIOD / SENSOR_PERIOD_RESOLUTION, sizeof ( uint8 ));
