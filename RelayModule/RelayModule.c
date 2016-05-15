@@ -104,10 +104,10 @@
 #endif  // defined ( CC2540_MINIDK )
 
 // Minimum connection interval (units of 1.25ms, 80=100ms) if automatic parameter update request is enabled
-#define DEFAULT_DESIRED_MIN_CONN_INTERVAL     160
+#define DEFAULT_DESIRED_MIN_CONN_INTERVAL     80
 
 // Maximum connection interval (units of 1.25ms, 800=1000ms) if automatic parameter update request is enabled
-#define DEFAULT_DESIRED_MAX_CONN_INTERVAL     160
+#define DEFAULT_DESIRED_MAX_CONN_INTERVAL     80
 
 // Slave latency to use if automatic parameter update request is enabled
 #define DEFAULT_DESIRED_SLAVE_LATENCY         0
@@ -208,6 +208,8 @@ static bool   ainEnabled = FALSE;
 static bool   pwrEnabled = FALSE;
 static bool   relayEnabled = FALSE;
 
+static uint8  relayState = 0;
+
 static uint16 sensorAinPeriod = AIN_DEFAULT_PERIOD;
 static uint16 sensorPwrPeriod = PWR_DEFAULT_PERIOD;
 
@@ -218,13 +220,8 @@ static void RelayModule_ProcessOSALMsg( osal_event_hdr_t *pMsg );
 static void peripheralStateNotificationCB( gaprole_States_t newState );
 
 static uint16 readAdcData( uint8 channel );
+static uint16 sampleSensorValue( uint8 channel );
 static void readPower(void);
-static uint16 ensureVdd(void);
-static uint16 sample5Vcal( uint8 channel );
-static uint16 sampleAdcValue( uint8 channel );
-static int16 convertToQFormat (int16 num, int16 maxNum);
-static int16 convertToInt (int16 num, int32 amp);
-static int q15Mul(int a, int b);
 
 static void ainChangeCB( uint8 paramID );
 static void powerChangeCB( uint8 paramID );
@@ -390,6 +387,7 @@ void RelayModule_Init( uint8 task_id )
 
   // Setup a delayed profile startup
   osal_set_event( RelayModule_TaskID, SBP_START_DEVICE_EVT );
+  HalLedSet (HAL_LED_1, HAL_LED_MODE_ON);
 }
 
 /*********************************************************************
@@ -875,6 +873,7 @@ static void relayChangeCB( uint8 paramID )
         {
           relayEnabled = FALSE;
           HalRelayOff();
+          relayState = 0;
           Relay_SetParameter(SENSOR_DATA, RELAY_DATA_LEN, &newValue);
         }
       }
@@ -884,6 +883,7 @@ static void relayChangeCB( uint8 paramID )
         {
           relayEnabled = TRUE;
           HalRelayOn();
+          relayState = 1;
           Relay_SetParameter(SENSOR_DATA, RELAY_DATA_LEN, &newValue);
         }
       }
@@ -967,194 +967,53 @@ static void resetCharacteristicValues( void )
 
 static void readPower( void )
 {
-  uint8 i;
-  uint16 read, current, currCoffi, zeroCurrSample = 0, readAvg = 0;
+  uint16 current, zeroCurrSample = 0, readAvg = 0;
   
-  int16 MeasuredCurrentValue;
-  int32 MeasuredPowerValue;
-  int32 vdd, coefficient, readCurrent;
-  
-  zeroCurrSample = sample5Vcal(HAL_ADC_CHANNEL_4);
-  zeroCurrSample = (zeroCurrSample*5)/6; //zeroCurrSample * (10K/12K), HW Output Voltage divider with 2k and 10k
-  zeroCurrSample = zeroCurrSample + 80; //corrected value@zeroCurrent
+  uint16 MeasuredCurrentValue;
+  uint32 MeasuredPowerValue;
 
-  for (i = 0; i<5; i++){
-    read = sampleAdcValue(HAL_ADC_CHANNEL_0); //read ACS712 output voltage
-    readAvg += read;
+  zeroCurrSample = sampleSensorValue(HAL_ADC_CHANNEL_4);
+  readAvg = sampleSensorValue(HAL_ADC_CHANNEL_0);
+
+  if (relayState == 0){
+    zeroCurrSample += 64;
+  } else if (relayState == 1) {
+    zeroCurrSample -= 25;
   }
-  readAvg = readAvg / 5;
-  //readAvg = 5945; //for test, Assume current = 2A
   
   if(readAvg > zeroCurrSample){
     current = readAvg - zeroCurrSample;
   }else{
     current = zeroCurrSample - readAvg;
   }
-  
-  if(current < 10) { //corrected value@zeroCurrent
+
+  if(current < 50) {
     current = 0;
-  }   
-  
-  current = convertToQFormat( current, 8191); //HAL_ADC_RESOLUTION_14  2^13 - 1 = 8191
+  }
 
-  vdd = ensureVdd(); //Internal reference voltage (1.24V-CC2541)
-  vdd = (vdd*372)/511; //( vdd*(1.24V/511) )*3, HAL_ADC_RESOLUTION_10 2^9 - 1 = 511
-  coefficient = (vdd*459)/100; //vdd*(1/1.414)*(1/0.154V)
-  currCoffi = convertToQFormat( coefficient, 10000);
-  /* ACS712 datasheet - Sensitivity = 185 mV/A
-     HW Output Voltage divider with 2k and 10k
-     185mV/A * (10k/12k) = 154mV/A */
+  MeasuredCurrentValue = (uint16)(((float)current / 8191) * 3300 * (100 / 26.163));  // Unit: mA
+  MeasuredPowerValue = MeasuredCurrentValue * 110;  // Unit: mW
 
-  readCurrent = q15Mul(current, currCoffi);
-  readCurrent = convertToInt(readCurrent, 1000000); //current coefficient total divider 100*10000, (vdd*459)/"100",  convertToQFormat( cofficient1, "10000")
-
-  MeasuredCurrentValue = readCurrent / 10; //Unit: mA
-  MeasuredPowerValue = readCurrent * 11; //Unit: mW, (readCurrent/10)mA * 110V 
- 
   Power_SetParameter( SENSOR_DATA, POWER_DATA_LEN, &MeasuredPowerValue );
   Power_SetParameter( SENSOR_DATA1, CURRENT_DATA_LEN, &MeasuredCurrentValue );
 }
 
-//ACS712 Zero Current Output Voltag is Vdd/2 (Pin 5VCal),Calibration the Output Voltag
-static uint16 sample5Vcal( uint8 channel )
+static uint16 sampleSensorValue( uint8 channel )
 {
   uint8 i;
-  uint16 voltage = 0;
+  uint16 sensorValue = 0, sensorMax = 0;
 
   HalAdcSetReference(HAL_ADC_REF_AVDD);
   
-  for (i = 0; i<8; i++){
-    voltage += HalAdcRead(channel, HAL_ADC_RESOLUTION_14);
-  }
-
-  voltage = voltage >> 3;
-  
-  return voltage;
-}
-
-static uint16 sampleAdcValue( uint8 channel ) //Find the maximum of input sine wave
-{
-  uint16 read[16], read1[10], read2[10], maxNum = 0;
-  uint8 i, j, k;
-  HalAdcSetReference(HAL_ADC_REF_AVDD);
-  
-  //Sine wave freq. = 60Hz, Sample 16 points / Period, (1/60Hz)/16 ~= 1.041ms
-  //1st
-/*       *(max) 
-(max-1)*   *(max+1)
-      *     *
-     *       *
-    *         *         
-               *       *
-                *     *
-                 *   *
-                   *      */
-  for (i = 0; i<16; i++)
-  {
-    read[i] = HalAdcRead(channel, HAL_ADC_RESOLUTION_14);
-    HAL_DELAY(130); //125 cycles ~1 msec, delay 1.041ms ~130 cycles
-    read[i] = read[i];
-    
-    if(maxNum < read[i]) {
-      maxNum = read[i];
-      j = i;
-    }
-  }
-
-/*       * (max)
-           x
-            x
-             x between (max) and (max+1) Sample 10 points
-    *(max-1)  *(max+1)   */
-  for (i = 0; i<16; i++)
-  {
-    HAL_DELAY(130); //delay 1.041ms
-    if (i == j) {
-      for (k = 0; k < 10; k++) {
-        read1[k] = HalAdcRead(channel, HAL_ADC_RESOLUTION_14);
-        HAL_DELAY(13); //delay 1.041ms/10 = 0.104ms ~13 cycles
-        
-        if(maxNum < read1[k]) {
-          maxNum = read1[k];
-        }
-      }
-    }
-  }
-
-/*       * (max)
-       x    
-      x      
-     x  between (max-1)and(max) Sample 10 points
-    *(max-1)  *(max+1)   */
-  for (i = 0; i<16; i++)
-  {
-    HAL_DELAY(130); //delay 1.041ms
-    if (i == j-1) {
-      for (k = 0; k < 10; k++) {
-        read2[k] = HalAdcRead(channel, HAL_ADC_RESOLUTION_14);
-        HAL_DELAY(13); //delay 1.041ms/10 = 0.104ms ~13 cycles
-        
-        if(maxNum < read2[k]) {
-          maxNum = read2[k];
-        }
-      }
+  for (i = 0; i < 128; i++){
+    sensorValue = HalAdcRead(channel, HAL_ADC_RESOLUTION_14);
+    if(sensorValue > sensorMax){
+      sensorMax = sensorValue;
     }
   }
   
-  return maxNum;
+  return sensorMax;
 }
 
-static int16 convertToQFormat (int16 num, int16 maxNum)
-{
-  int16 i = 0;
-  
-  if (num > 0) {
-    i = (int16)(((int32)num << 15) / (int32)maxNum);
-  }
-  
-  return i;
-}
-
-static int16 convertToInt (int16 num, int32 amp)
-{
-  uint8 i;
-  int32 tempNum = 0, conNum = 0;
-
-  for (i = 1; i < 16; i++)
-  {
-    tempNum = (num >> (15-i));
-    if (tempNum%2 == 1)
-    {
-      tempNum = 1;
-      tempNum = (tempNum*amp) >> i;
-      conNum += tempNum;
-    } else 
-    {
-      tempNum = 0;
-    }   
-  }
-
-  return conNum;
-}
-
-static int q15Mul(int a, int b)
-{
-    long int tmp = ((long int)a * (long int)b) / 32768; // shift right 15-bits
-
-    if ( tmp >= 32767 ) tmp = 32767;
-    if ( tmp <= (-32767) ) tmp = -32767;
-    
-    return (int)tmp;
-}
-
-static uint16 ensureVdd(void)
-{
-  uint16 adcValue = 0;
-
-  HalAdcSetReference(HAL_ADC_REF_125V);
-  adcValue = HalAdcRead(HAL_ADC_CHN_VDD3, HAL_ADC_RESOLUTION_10);
-  
-  return adcValue;
-}
 /*********************************************************************
 *********************************************************************/
